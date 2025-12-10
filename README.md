@@ -6,7 +6,7 @@ Very simple Transformer [(Vaswani and Al, 2017)](https://arxiv.org/abs/1706.0376
 Please find the weights on the associated [HuggingFace repo](https://huggingface.co/amaury-delille/PhoGPT-20M).
 
 ## Demo
-<video src="assets/demo.gif" controls width="640"></video>
+![Demo](assets/demo.gif)
 
 ## Next Steps
 - Train more
