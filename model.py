@@ -7,22 +7,26 @@ import logging
 from pathlib import Path
 import time
 import csv
+from safetensors.torch import save_file
 
 project_root = Path(__file__).parent.resolve()
 
 loss_metrics_file = project_root / "metrics" / "loss.csv"
-with open(loss_metrics_file, 'w') as file:
-    writer = csv.writer(file)
-    writer.writerow(['epoch', 'batch', 'loss'])
+loss_metrics_file.parent.mkdir(parents=True, exist_ok=True)
+if not loss_metrics_file.exists() or loss_metrics_file.stat().st_size == 0:
+    with open(loss_metrics_file, 'w', newline='') as file:
+        writer = csv.writer(file)
+        writer.writerow(['epoch', 'batch', 'loss'])
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 DIM_MODEL = 512
-DIM_FF_HIDDEN = 512
-NUM_HEADS = 4
-SRC_VOCAB_SIZE = 18000
-TGT_VOCAB_SIZE = 6800
+DIM_FF_HIDDEN = 2048 
+NUM_LAYERS = 6  
+NUM_HEADS = 8
+SRC_VOCAB_SIZE = 32000
+TGT_VOCAB_SIZE = 32000
 
 def get_sentences(file_path: str) -> List[str]:
     with open(file=file_path, mode='r', encoding='utf-8') as file:
@@ -78,7 +82,6 @@ class Tokenizer:
         return torch.stack([self._pad_encoded_content(ids) for ids in batch_ids])
 
     def decode(self, encoded: torch.Tensor) -> str:
-        # strip padding and any custom BOS/EOS before decoding
         ids = [i for i in encoded.flatten().tolist() if i != self.pad_token and i not in (self.bos_token, self.eos_token)]
         return self.sp.decode(ids)
 
@@ -140,7 +143,7 @@ class MultiHeadAttention(nn.Module):
         return self.out_proj(attention_values), K, V
 
 class CrossMultiHeadAttention(nn.Module):
-    def __init__(self, d_model: int, num_heads: int) -> None:
+    def __init__(self, d_model: int, num_heads: int, dropout: float = 0.1) -> None:
         assert d_model % num_heads == 0, "Wrong shapes buddy"
 
         super().__init__()
@@ -149,27 +152,37 @@ class CrossMultiHeadAttention(nn.Module):
         self.d_k = d_model // num_heads
 
         self.q_proj = nn.Linear(in_features=self.d_model, out_features=self.d_model, bias=False)
+        self.k_proj = nn.Linear(in_features=self.d_model, out_features=self.d_model, bias=False)
+        self.v_proj = nn.Linear(in_features=self.d_model, out_features=self.d_model, bias=False)
 
         self.out_proj = nn.Linear(in_features=self.d_k * num_heads, out_features=self.d_model, bias=False)
+        self.dropout = nn.Dropout(p=dropout)
 
-    def forward(self, x: torch.Tensor, K: torch.Tensor, V: torch.Tensor, kv_pad_mask: torch.Tensor = None, q_pad_mask: torch.Tensor = None, mask: bool = False) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, encoder_output: torch.Tensor, kv_pad_mask: torch.Tensor = None) -> torch.Tensor:
+        """
+        Cross-attention: Q from decoder, K/V from encoder output.
+        
+        Args:
+            x: decoder hidden states (B, N_q, d_model)
+            encoder_output: encoder output (B, N_k, d_model)
+            kv_pad_mask: mask for encoder padding (B, 1, 1, N_k)
+        """
         B, N_q, D = x.shape
+        N_k = encoder_output.size(1)
 
         Q = self.q_proj(x).view(B, N_q, self.num_heads, self.d_k).transpose(1, 2)
+        K = self.k_proj(encoder_output).view(B, N_k, self.num_heads, self.d_k).transpose(1, 2)
+        V = self.v_proj(encoder_output).view(B, N_k, self.num_heads, self.d_k).transpose(1, 2)
 
         attention_scores = (Q @ K.transpose(-2, -1)) / (self.d_k ** 0.5)  # (B, heads, N_q, N_k)
 
-        if q_pad_mask is not None:
-            attention_scores = attention_scores.masked_fill(~q_pad_mask.expand(B, 1, N_q, K.size(-2)), float('-inf'))
-
         if kv_pad_mask is not None:
-            attention_scores = attention_scores.masked_fill(~kv_pad_mask.expand(B, 1, N_q, K.size(-2)), float('-inf'))
+            attention_scores = attention_scores.masked_fill(~kv_pad_mask.expand(B, 1, N_q, N_k), float('-inf'))
 
-        # if mask:
-        #     allow_all = torch.ones(N_q, N_k, device=x.device)
-        #     attention_scores = attention_scores.masked_fill(allow_all == 0, float('-inf'))
-
-        attention_values = F.softmax(attention_scores, dim=-1) @ V  # (B, heads, N_q, d_k)
+        attention_weights = F.softmax(attention_scores, dim=-1)
+        attention_weights = self.dropout(attention_weights)
+        
+        attention_values = attention_weights @ V  # (B, heads, N_q, d_k)
         attention_values = attention_values.transpose(1, 2).contiguous().view(B, N_q, self.d_k * self.num_heads)
 
         return self.out_proj(attention_values)
@@ -189,107 +202,138 @@ class LayerNorm(nn.Module):
 
         return self.gamma * x_hat + self.beta
 
-class AddAndNorm(nn.Module):
-    def __init__(self, d_model: int) -> None:
-        super().__init__()
-        self.d_model = d_model
-        self.layer_norm = LayerNorm(d_model=d_model)
-
-    def forward(self, x: torch.Tensor, sub_layer: torch.Tensor) -> torch.Tensor:
-        return self.layer_norm(x + sub_layer)
-
 class FeedForward(nn.Module):
-    def __init__(self, d_model: int, d_hidden: int) -> None:
+    def __init__(self, d_model: int, d_hidden: int, dropout: float = 0.1) -> None:
         super().__init__()
         self.model = nn.Sequential(
             nn.Linear(in_features=d_model, out_features=d_hidden),
-            nn.Dropout(p=0.2),
+            nn.ReLU(),
+            nn.Dropout(p=dropout),
             nn.Linear(in_features=d_hidden, out_features=d_model),
+            nn.Dropout(p=dropout),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.model(x)
 
-class Encoder(nn.Module):
-    def __init__(self, d_model: int, num_heads: int, verbose: bool) -> None:
+class EncoderLayer(nn.Module):
+    def __init__(self, d_model: int, num_heads: int, d_ff: int, dropout: float = 0.1) -> None:
         super().__init__()
         self.mha = MultiHeadAttention(d_model=d_model, num_heads=num_heads, mask=False)
-        self.add_and_norm_1 = AddAndNorm(d_model=d_model)
-        self.ff = FeedForward(d_model=d_model, d_hidden=DIM_FF_HIDDEN)
-        self.add_and_norm_2 = AddAndNorm(d_model=d_model)
+        self.dropout1 = nn.Dropout(p=dropout)
+        self.norm1 = LayerNorm(d_model=d_model)
+        self.ff = FeedForward(d_model=d_model, d_hidden=d_ff, dropout=dropout)
+        self.norm2 = LayerNorm(d_model=d_model)
 
-    def forward(self, x: torch.Tensor, pad_mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        x_mha, K, V = self.mha.forward(x=x, attention_mask=pad_mask)
-        x = self.add_and_norm_1(x, x_mha)
+    def forward(self, x: torch.Tensor, pad_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        x_mha, _, _ = self.mha.forward(x=x, attention_mask=pad_mask)
+        x = self.norm1(x + self.dropout1(x_mha))
         x_ff = self.ff(x)
-        return self.add_and_norm_2(x, x_ff), K, V
+        x = self.norm2(x + x_ff)
+        return x
 
-class Decoder(nn.Module):
-    def __init__(self, d_model: int, num_heads: int, vocab_size: int, verbose: bool) -> None:
+
+class Encoder(nn.Module):
+    def __init__(self, d_model: int, num_heads: int, num_layers: int, d_ff: int, dropout: float = 0.1) -> None:
+        super().__init__()
+        self.layers = nn.ModuleList([
+            EncoderLayer(d_model=d_model, num_heads=num_heads, d_ff=d_ff, dropout=dropout)
+            for _ in range(num_layers)
+        ])
+
+    def forward(self, x: torch.Tensor, pad_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        for layer in self.layers:
+            x = layer(x, pad_mask=pad_mask)
+        return x
+
+class DecoderLayer(nn.Module):
+    def __init__(self, d_model: int, num_heads: int, d_ff: int, dropout: float = 0.1) -> None:
         super().__init__()
         self.mha = MultiHeadAttention(d_model=d_model, num_heads=num_heads, mask=True)
-        self.add_and_norm_1 = AddAndNorm(d_model=d_model)
-        self.cmha = CrossMultiHeadAttention(d_model=d_model, num_heads=num_heads)
-        self.add_and_norm_2 = AddAndNorm(d_model=d_model)
-        self.ff = FeedForward(d_model=d_model, d_hidden=DIM_FF_HIDDEN)
-        self.add_and_norm_3 = AddAndNorm(d_model=d_model)
+        self.dropout1 = nn.Dropout(p=dropout)
+        self.norm1 = LayerNorm(d_model=d_model)
+        self.cmha = CrossMultiHeadAttention(d_model=d_model, num_heads=num_heads, dropout=dropout)
+        self.dropout2 = nn.Dropout(p=dropout)
+        self.norm2 = LayerNorm(d_model=d_model)
+        self.ff = FeedForward(d_model=d_model, d_hidden=d_ff, dropout=dropout)
+        self.norm3 = LayerNorm(d_model=d_model)
+
+    def forward(
+            self,
+            x: torch.Tensor,
+            encoder_output: torch.Tensor,
+            kv_pad_mask: Optional[torch.Tensor] = None,
+            q_pad_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        x_mha, _, _ = self.mha.forward(x=x, attention_mask=q_pad_mask)
+        x = self.norm1(x + self.dropout1(x_mha))
+        x_cmha = self.cmha.forward(x, encoder_output=encoder_output, kv_pad_mask=kv_pad_mask)
+        x = self.norm2(x + self.dropout2(x_cmha))
+        x_ff = self.ff(x)
+        x = self.norm3(x + x_ff)
+        return x
+
+
+class Decoder(nn.Module):
+    def __init__(self, d_model: int, num_heads: int, num_layers: int, d_ff: int, vocab_size: int, dropout: float = 0.1) -> None:
+        super().__init__()
+        self.layers = nn.ModuleList([
+            DecoderLayer(d_model=d_model, num_heads=num_heads, d_ff=d_ff, dropout=dropout)
+            for _ in range(num_layers)
+        ])
         self.linear = nn.Linear(in_features=d_model, out_features=vocab_size)
 
     def forward(
             self,
             x: torch.Tensor,
-            K: torch.Tensor,
-            V: torch.Tensor,
+            encoder_output: torch.Tensor,
             kv_pad_mask: Optional[torch.Tensor] = None,
             q_pad_mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        x_mha, _, _ = self.mha.forward(x=x, attention_mask=q_pad_mask)
-        x = self.add_and_norm_1(x, x_mha)
-        x_cmha = self.cmha.forward(x, K=K, V=V, kv_pad_mask=kv_pad_mask)
-        x = self.add_and_norm_2(x, x_cmha)
-        x_ff = self.ff(x)
-        x = self.add_and_norm_3(x, x_ff)
-        x = self.linear(x)
-        return x
+        for layer in self.layers:
+            x = layer(x, encoder_output=encoder_output, kv_pad_mask=kv_pad_mask, q_pad_mask=q_pad_mask)
+        return self.linear(x)
 
 class Transformer(nn.Module):
-    def __init__(self, d_model: int, num_heads: int, src_vocab_size: int, tgt_vocab_size: int, verbose: bool) -> None:
+    def __init__(self, d_model: int, num_heads: int, num_layers: int, d_ff: int, 
+                 src_vocab_size: int, tgt_vocab_size: int, dropout: float = 0.1) -> None:
         super().__init__()
+        self.d_model = d_model
         self.src_embedding = nn.Embedding(src_vocab_size, d_model)
         self.tgt_embedding = nn.Embedding(tgt_vocab_size, d_model)
         self.pe = PositionalEncoding(d_model=d_model)
-        self.encoder = Encoder(d_model=d_model, num_heads=num_heads, verbose=verbose)
-        self.decoder = Decoder(d_model=d_model, num_heads=num_heads, vocab_size=tgt_vocab_size, verbose=verbose)
+        self.dropout = nn.Dropout(p=dropout)
+        self.encoder = Encoder(d_model=d_model, num_heads=num_heads, num_layers=num_layers, d_ff=d_ff, dropout=dropout)
+        self.decoder = Decoder(d_model=d_model, num_heads=num_heads, num_layers=num_layers, d_ff=d_ff, vocab_size=tgt_vocab_size, dropout=dropout)
 
     def forward(self, src: torch.Tensor, tgt: torch.Tensor) -> torch.Tensor:
-        src_embedded = self.pe(self.src_embedding(src.long()))  # (B, seq_len, d_model)
-        tgt_embedded = self.pe(self.tgt_embedding(tgt.long()))  # (B, seq_len, d_model)
+        # Scale embeddings by sqrt(d_model) as per original paper
+        scale = self.d_model ** 0.5
+        src_embedded = self.dropout(self.pe(self.src_embedding(src.long()) * scale))  # (B, seq_len, d_model)
+        tgt_embedded = self.dropout(self.pe(self.tgt_embedding(tgt.long()) * scale))  # (B, seq_len, d_model)
 
         src_kv_mask = AttentionUtils.make_kv_pad_mask(tokens=src, pad_id=0)
         tgt_q_mask = AttentionUtils.make_q_pad_mask(tokens=tgt, pad_id=0)
 
-        encoded, K, V = self.encoder(src_embedded, pad_mask=src_kv_mask)
-        return self.decoder(x=tgt_embedded, K=K, V=V, kv_pad_mask=src_kv_mask, q_pad_mask=tgt_q_mask)  # (B, seq_len, vocab_size)
+        encoder_output = self.encoder(src_embedded, pad_mask=src_kv_mask)
+        return self.decoder(x=tgt_embedded, encoder_output=encoder_output, kv_pad_mask=src_kv_mask, q_pad_mask=tgt_q_mask)  # (B, seq_len, vocab_size)
 
 class Trainer:
-    def __init__(self, batch_size: int, epochs: int, slice_size: int, device: str, verbose: bool) -> None:
+    def __init__(self, batch_size: int, epochs: int, device: str, verbose: bool) -> None:
         self.d_model = DIM_MODEL
         self.num_heads = NUM_HEADS
-        self.src_vocab_size = 32000
-        self.tgt_vocab_size = 19000
         self.max_len = 128
         self.device = torch.device(device)
         self.verbose = verbose
 
         self.batch_size = batch_size
         self.epochs = epochs
-        self.slice_size = slice_size
 
         en_sents = project_root / "dataset" / "en_sents"
         vi_sents = project_root / "dataset" / "vi_sents"
 
-        self.en_sents = get_sentences(str(en_sents))[:self.slice_size]
-        self.vi_sents = get_sentences(str(vi_sents))[:self.slice_size]
+        self.en_sents = get_sentences(str(en_sents))
+        self.vi_sents = get_sentences(str(vi_sents))
 
         self.en_tokenizer = Tokenizer(max_len=self.max_len, spm_model_path=str(project_root / "tokenizer" / "en_spm.model"))
         self.vi_tokenizer = Tokenizer(max_len=self.max_len, spm_model_path=str(project_root / "tokenizer" / "vi_spm.model"))
@@ -300,9 +344,10 @@ class Trainer:
         self.transformer = Transformer(
             d_model=self.d_model,
             num_heads=self.num_heads,
+            num_layers=NUM_LAYERS,
+            d_ff=DIM_FF_HIDDEN,
             src_vocab_size=self.en_tokenizer.vocab_size,
             tgt_vocab_size=self.vi_tokenizer.vocab_size,
-            verbose=True
         )
 
         logger.info(f"Loaded transformer with: {sum(p.numel() for p in self.transformer.parameters())} parameters")
@@ -360,45 +405,76 @@ class Trainer:
         return total_loss / max(1, num_batches)
 
     def train(self):
+      checkpoint_dir = project_root / "checkpoints"
+      checkpoint_dir.mkdir(parents=True, exist_ok=True)
+      last_epoch = 0
       try:
         start_time = time.time()
         for epoch in range(self.epochs):
             logger.info(f"\n=== Epoch {epoch + 1}/{self.epochs} ===")
             avg_loss = self.train_epoch(epoch)
             logger.info(f"Average Loss: {avg_loss:.4f}")
+
+            state = {
+                "state_dict": self.transformer.state_dict(),
+                "vocab_size": self.vocab_size,
+                "d_model": self.d_model,
+                "num_heads": self.num_heads,
+                "num_layers": NUM_LAYERS,
+                "d_ff": DIM_FF_HIDDEN,
+                "max_len": self.max_len,
+            }
+            base = checkpoint_dir / f"transformer_epoch_{epoch + 1}"
+            torch.save(state, str(base.with_suffix(".pth")))
+            torch.save(state, str(base.with_suffix(".bin")))
+            save_file(state["state_dict"], str(base.with_suffix(".safetensors")))
+            last_epoch = epoch + 1
+
         end_time = time.time()
         logger.info(f"Training time: {end_time - start_time:.2f} seconds")
-        torch.save(
-            {
-                "state_dict": self.transformer.state_dict(),
-                "vocab_size": self.vocab_size,
-                "d_model": self.d_model,
-                "num_heads": self.num_heads,
-                "max_len": self.max_len,
-            },
-            str(project_root / "checkpoints" / "transformer.pth"),
-        )
+      except KeyboardInterrupt as e:
+          state = {
+              "state_dict": self.transformer.state_dict(),
+              "vocab_size": self.vocab_size,
+              "d_model": self.d_model,
+              "num_heads": self.num_heads,
+              "num_layers": NUM_LAYERS,
+              "d_ff": DIM_FF_HIDDEN,
+              "max_len": self.max_len,
+          }
+          base = checkpoint_dir / f"transformer_latest_epoch_{last_epoch}"
+          torch.save(state, str(base.with_suffix(".pth")))
+          torch.save(state, str(base.with_suffix(".bin")))
+          save_file(state["state_dict"], str(base.with_suffix(".safetensors")))
+          raise e
       except Exception as e:
-          torch.save(
-            {
-                "state_dict": self.transformer.state_dict(),
-                "vocab_size": self.vocab_size,
-                "d_model": self.d_model,
-                "num_heads": self.num_heads,
-                "max_len": self.max_len,
-            },
-            str(project_root / "checkpoints" / "transformer.pth"),
-        )
+          state = {
+              "state_dict": self.transformer.state_dict(),
+              "vocab_size": self.vocab_size,
+              "d_model": self.d_model,
+              "num_heads": self.num_heads,
+              "num_layers": NUM_LAYERS,
+              "d_ff": DIM_FF_HIDDEN,
+              "max_len": self.max_len,
+          }
+          base = checkpoint_dir / f"transformer_latest_epoch_{last_epoch}"
+          torch.save(state, str(base.with_suffix(".pth")))
+          torch.save(state, str(base.with_suffix(".bin")))
+          save_file(state["state_dict"], str(base.with_suffix(".safetensors")))
+          raise e
 
 
 class Translator:
     def __init__(self, model_path: str) -> None:
         ckpt = torch.load(model_path)
-        self.model = Transformer(d_model=ckpt.get("d_model", DIM_MODEL),
-                                 num_heads=ckpt.get("num_heads", NUM_HEADS),
-                                 src_vocab_size=SRC_VOCAB_SIZE,
-                                 tgt_vocab_size=TGT_VOCAB_SIZE,
-                                 verbose=True)
+        self.model = Transformer(
+            d_model=ckpt.get("d_model", DIM_MODEL),
+            num_heads=ckpt.get("num_heads", NUM_HEADS),
+            num_layers=ckpt.get("num_layers", NUM_LAYERS),
+            d_ff=ckpt.get("d_ff", DIM_FF_HIDDEN),
+            src_vocab_size=SRC_VOCAB_SIZE,
+            tgt_vocab_size=TGT_VOCAB_SIZE,
+        )
         self.model.load_state_dict(ckpt["state_dict"])
         self.model.eval()
 
@@ -478,9 +554,11 @@ class Translator:
             print()
 
 if __name__ == "__main__":
-    # trainer = Trainer(batch_size=128, epochs=5, slice_size=254000, device="mps", verbose=False)
-    # trainer.train()
+    trainer = Trainer(batch_size=128, epochs=10, device="mps", verbose=False)
+    print(sum(p.numel() for p in trainer.transformer.parameters()))
+    trainer.train()
 
-    translator = Translator(model_path=str(project_root / "checkpoints" / "transformer.pth"))
+
+    translator = Translator(model_path=str(project_root / "checkpoints" / "transformer_latest_epoch_1.pth"))
     original = "How are you ?"
     translator.run()
